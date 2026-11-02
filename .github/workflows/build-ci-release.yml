@@ -1,0 +1,451 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# CI 构建发布：任意分支 push 即出包（只出 release 变体、固定密钥签名），每次构建发成一个
+#   独立 tag 的预发布页。
+#   母版：知识库 100_System/templates/build-ci-release-standalone.workflow.yml —— 独立页模型，
+#   不调 refresh_ci_page.sh、不做「保留 N 组」清理（旧页按 tag 排序即历史）。
+#
+# 本项目（Kotlin/Gradle + LSPosed 模块 + fork 身份）对母版的改写点，每条都是「照抄就会红」：
+#   ① 版本号来源：源码版本在 app/version.properties（不是 Gradle DSL）⇒ 读法换 sed 正则；
+#      注入走工程自带的 -PversionCodeOverride / -PversionNameOverride（app/build.gradle.kts），
+#      不需要母版假设的 -PciVersionSuffix，也不必为 CI 改源码。
+#   ② versionCode = CI_VERSION_CODE_BASE + 运行序号：与上游正式版序列（当前 31）彻底分开，
+#      同一版本的多次 CI 构建不撞号。
+#   ③ 签名：项目没有 signingConfigs（上游正式包由作者本地手签），assembleRelease 产出的是
+#      app-release-unsigned.apk ⇒ 母版「往 local.properties 写 storeFile、交给 Gradle 签」在此
+#      不成立，改为 CI 内 zipalign + apksigner 手签（源码零改动）。
+#   ④ 作用域门禁：本项目是动态作用域（module.prop 里 staticScope=false、scope.list 是空文件），
+#      母版「scope.list 必须非空」在此必红 ⇒ 改成断言 staticScope=false 且 scope.list 为空。
+#   ⑤ fork 身份（包名 / 显示名 / 应用内更新源）由 scripts/ci-fork-identity.py 在 runner 工作区
+#      改写，仓库源码与上游保持逐字一致。
+#   ⑥ tag 一律 ci- 前缀：上游 publish-release-manifest.yml 的触发条件是 release published 且
+#      tag 以 v 开头 —— 用 v 前缀会白跑一次并可能改写 latest-*.json。
+# ══════════════════════════════════════════════════════════════════════════════
+name: Build · CI · Release
+
+run-name: "Build · CI · Release · ${{ github.ref_name }}"
+
+on:
+  push:
+    # ⚠️ 必须显式写 branches：只写 paths-ignore 时**标签推送也会触发**
+    branches: ['**']
+    paths-ignore:            # 纯文档/数据改动不必出包
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - 'docs/**'
+      - 'latest-*.json'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '要构建的提交/tag（留空则构建当前触发 ref）'
+        type: string
+        required: false
+        default: ''
+
+# 同一分支只留最新一次构建：新提交进来就取消还在跑的旧 run。被取消的 run 会跳过后续所有
+#   step（`if: always()` 也救不回来），它若已建好页却没传完包，残页由下一个 run 的 Sweep 清。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # 发布 Release 需要写权限
+
+env:
+  # ════════════════════════ PROJECT-CUSTOM-BEGIN ════════════════════════
+  # 产物名前缀 = fork 显示名。进文件名与下载 URL ⇒ 只允许 A-Za-z0-9._-
+  PREFIX: Guise.F
+  # 版本号来源文件（sed 取 versionName / versionCode）
+  VERSION_FILE: app/version.properties
+  # 独立页：tag 前缀与 Sweep 的匹配规则必须同源
+  TAG_PREFIX: ci-
+  TAG_PATTERN: '^ci-[0-9]{8}-[0-9]{4}-[0-9a-f]{8}-r[0-9]+$'
+  # 构建环境（与本工程 compileSdk=37 / buildToolsVersion=37.0.0 对齐）
+  JAVA_VERSION: '21'
+  ANDROID_PLATFORM: android-37.0
+  BUILD_TOOLS: 37.0.0
+  # 工程形态：xposed = LSPosed 模块（跑 libxposed 三件套 / 作用域 / 入口类断言）
+  MODULE_KIND: xposed
+  EXPECT_TARGET_API: '102'
+  # fork 身份：ci-fork-identity.py 改写后的值，产物门禁按它们核对
+  EXPECT_PACKAGE: com.houvven.guise.fork
+  EXPECT_LABEL: Guise.F
+  EXPECT_ABI: arm64-v8a
+  # tokens/Signing/Vstory.jks 的证书 SHA-256（去冒号、大写）
+  EXPECTED_CERT_SHA256: '8D1B6022D3E3BB837A3BA1870E0EEAC8650F9470B8287EDF549DACEC9E9E2A64'
+  # versionCode = 基数 + 运行序号。5000 远高于上游正式版（31），且不随提交数倒退
+  CI_VERSION_CODE_BASE: '5000'
+  # 未签名产物（项目没有 signingConfigs，AGP 输出 -unsigned.apk）
+  APK_OUT_RELEASE: app/build/outputs/apk/release/app-release-unsigned.apk
+  PUSH_VARIANT: release
+  # ═════════════════════════ PROJECT-CUSTOM-END ═════════════════════════
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    env:
+      # checkout 内部的 `git init` 会为默认分支名打十几行 hint（那个空仓库随即被覆盖）
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: init.defaultBranch
+      GIT_CONFIG_VALUE_0: main
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # AGP 会往 APK 里写 version-control-info；浅克隆下该信息不完整
+          ref: ${{ inputs.ref || github.sha }}
+
+      # 被 concurrency 取消的 run 跳过后续所有 step ⇒ 停在「页已建、包没传完」时自己收不了尾，
+      #   只能由下一个 run 在开头顺手清。判据：页的 target_commitish 命中「只被取消过、从未
+      #   success」的 head sha；再叠加 TAG_PATTERN —— 同仓库里手发页/图床页往往也是 prerelease，
+      #   不做这道过滤会连它们一起删。正在跑的 run conclusion 为 null，不会误伤。
+      - name: Sweep release pages of cancelled runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          WF=$(basename "${GITHUB_WORKFLOW_REF%%@*}")
+          rows=$(gh run list --workflow "$WF" --limit 100 \
+                   --json headSha,conclusion \
+                   --jq '.[] | "\(.headSha) \(.conclusion)"' || true)
+          dead=$(printf '%s\n' "$rows" | awk '
+                   $2 == "success"   { ok[$1] = 1 }
+                   $2 == "cancelled" { seen[$1] = 1 }
+                   END { for (s in seen) if (!(s in ok)) print s }')
+          if [ -z "${dead//[[:space:]]/}" ]; then
+            echo "没有「只被取消过」的提交，跳过"
+            exit 0
+          fi
+          gh api "repos/${REPO}/releases?per_page=100" \
+            --jq '.[] | select(.prerelease) | "\(.target_commitish)\t\(.tag_name)\t\(.assets|length)"' \
+          | while IFS=$'\t' read -r sha tag assets; do
+              grep -qxF "$sha" <<<"$dead" || continue
+              grep -qE "$TAG_PATTERN" <<<"$tag" || continue
+              echo "::notice::清理被取消运行的产物页 ${tag}（资产 ${assets} 个）"
+              gh api -X DELETE "repos/${REPO}/releases/tags/${tag}" || true
+              gh api -X DELETE "repos/${REPO}/git/refs/tags/${tag}" || true
+            done
+
+      # 指定 ref 构建时（如复现某个历史提交），那棵树里没有 fork 的改写脚本，从 main 取一份备用
+      - name: Restore fork scripts
+        if: inputs.ref != ''
+        run: |
+          set -euo pipefail
+          git fetch -q origin main
+          mkdir -p scripts
+          git show origin/main:scripts/ci-fork-identity.py > scripts/ci-fork-identity.py
+
+      # 包名 / 显示名 / 更新源只在 runner 工作区改写：仓库里留着 fork 值会让上游一改这些行就冲突。
+      #   逐条按「期望原文出现次数必须为 1」校验，上游改写法时整体失败，不静默漏改。
+      - name: Apply fork identity
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-fork-identity.py \
+            --app-id "${EXPECT_PACKAGE}" --label "${PREFIX}" --label-suffix .F
+
+      - name: Set up JDK
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # 项目要求的具体 platform / build-tools 常不在 runner 镜像里，显式装 + 断言。
+      #   ⚠️ 自 API 37 起平台包名带 minor：装出来的目录是 platforms/android-37.0，而 compileSdk 的
+      #   minorApiLevel=0 正是让 AGP 按这个名字去找 —— 改成 android-37 反而找不到。
+      - name: Set up Android SDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKM="$(command -v sdkmanager || echo "$SDK/cmdline-tools/latest/bin/sdkmanager")"
+          echo "SDK=$SDK"
+          echo "sdkmanager=$SDKM"
+
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          for pkg in "platforms;${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}"; do
+            "$SDKM" "$pkg" >/dev/null 2>&1 || sudo "$SDKM" "$pkg" >/dev/null 2>&1 \
+              || echo "::warning::$pkg 安装返回非零"
+          done
+
+          test -f "$SDK/platforms/${ANDROID_PLATFORM}/android.jar" \
+            || { echo "::error::platforms/${ANDROID_PLATFORM} 未就位"; "$SDKM" --list 2>/dev/null | grep -i "${ANDROID_PLATFORM%%.*}" || true; exit 1; }
+          test -x "$SDK/build-tools/${BUILD_TOOLS}/aapt2" \
+            || { echo "::error::build-tools ${BUILD_TOOLS} 就位失败"; exit 1; }
+          echo "platforms: $(ls "$SDK/platforms" | tr '\n' ' ')"
+          echo "build-tools: $(ls "$SDK/build-tools" | tr '\n' ' ')"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+      - name: Gradle cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', 'gradle/libs.versions.toml', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Compute build info
+        id: info
+        run: |
+          echo "short=${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
+          echo "ts=$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
+
+      # tag / 产物名 / 包内版本号集中在这里解析：产物名被三处引用（重命名 / 门禁 / 发布），
+      #   任一处漏改都是静默错。也刻意放在编译之前 —— 解析失败只花几秒。
+      #   命名：<前缀>_<版本>.<code>_<时间>_ci-<变体>_<短号>.apk
+      - name: Resolve release info
+        id: target
+        env:
+          TS: ${{ steps.info.outputs.ts }}
+          SHORT: ${{ steps.info.outputs.short }}
+        run: |
+          set -euo pipefail
+          VER="$(sed -n 's/^versionName=//p' "$VERSION_FILE" | tr -d '\r' | head -1)"
+          if [ -z "$VER" ]; then
+            echo "::error::读不到 versionName（$VERSION_FILE）"
+            exit 1
+          fi
+          VER="$(printf '%s' "$VER" | tr -d '[:space:]')"
+          case "$VER" in
+            ""|*[!A-Za-z0-9._-]*) echo "::error::版本名含非法字符：'$VER'"; exit 1 ;;
+          esac
+
+          CODE=$(( CI_VERSION_CODE_BASE + GITHUB_RUN_NUMBER ))
+          # `+` 之后是 semver 构建元数据段，不参与版本比较；同一 versionCode 的多次构建靠它分辨
+          VN="${VER}+ci-release.${SHORT}"
+          TAG="${TAG_PREFIX}${TS}-${SHORT}-r${GITHUB_RUN_NUMBER}"
+          NAME="${PREFIX}_${VER}.${CODE}_${TS}_ci-release_${SHORT}.apk"
+
+          {
+            echo "tag=${TAG}"
+            echo "apkname=${NAME}"
+          } >> "$GITHUB_OUTPUT"
+          for kv in "VER=$VER" "CODE=$CODE" "EXPECT_VN=$VN"; do echo "${kv}" >> "$GITHUB_ENV"; done
+          echo "tag=${TAG}"
+          echo "产物名=${NAME}"
+          echo "包内版本=${VN}(${CODE})"
+
+      # 单测刻意排在包构建之前：秒级到分钟级，早失败省下 R8 流水线；RandomsTest 等纯 JVM 用例
+      #   在没有设备的环境里唯一能跑的地方就是这里。
+      - name: Unit tests
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:testDebugUnitTest :ktx-xposed:testDebugUnitTest
+
+      # 签名：固定密钥从 secrets 解码（各项目共用一把，见 tokens/Signing/）。
+      #   ⚠️ 4 个 secret 名是配套的一组，改名要同改：本处与 tokens/Signing/README.md。
+      #   ⚠️ 缺 secret 时**直接失败**：不回退 debug 签名 ——「构建成功、签名不对」要等覆盖安装
+      #      时才发现（签名不同会覆盖失败，还会丢掉模块作用域状态）。
+      - name: Prepare signing (fixed key from secrets)
+        env:
+          KEY_BASE64: ${{ secrets.KEY_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for v in KEY_BASE64 STORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::缺少签名 secret:$missing —— 拒绝回退（那会让产物无法覆盖升级）"
+            exit 1
+          fi
+
+          KS="$GITHUB_WORKSPACE/ci-signing.jks"
+          printf '%s' "$KEY_BASE64" | base64 -d > "$KS"
+
+          # 就地自检：解出的库能否用该口令打开、别名是否存在。否则「KEY_BASE64 其实是另一个库」
+          #   要拖到签名阶段才报错，且信息含糊。
+          keytool -list -keystore "$KS" -storepass:env STORE_PASSWORD -alias "$KEY_ALIAS" >/dev/null 2>&1 \
+            || { echo "::error::密钥库打不开或别名不存在 —— 核对 KEY_BASE64 / SIGNING_STORE_PASSWORD / SIGNING_KEY_ALIAS"; exit 1; }
+          echo "SIGN_KS=$KS" >> "$GITHUB_ENV"
+          echo "已校验：密钥库可打开、别名存在"
+
+      # 项目没有 signingConfigs ⇒ 这里出的是未签名包，签名在下一步手工做
+      - name: Gradle build
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon :app:assembleRelease \
+            -PversionCodeOverride="${CODE}" \
+            -PversionNameOverride="${EXPECT_VN}"
+          ls -la app/build/outputs/apk/release/ || true
+
+      # zipalign 必须在 apksigner 之前（签完再对齐会破坏签名块）。v1 显式关闭：minSdk 29 下它没有
+      #   作用，开着只会让产物多一节冗余块。
+      - name: Sign APK and assert naming rule
+        env:
+          STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          APKNAME: ${{ steps.target.outputs.apkname }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS}"
+          ZIPALIGN="$BT/zipalign"
+          APKSIGNER="$BT/apksigner"
+          [ -x "$ZIPALIGN" ] || { echo "::error::找不到 zipalign（$ZIPALIGN）"; exit 1; }
+          [ -x "$APKSIGNER" ] || { echo "::error::找不到 apksigner（$APKSIGNER）"; exit 1; }
+          if [ ! -f "$APK_OUT_RELEASE" ]; then
+            # 出现 app-release.apk 反而说明有人给工程加了 signingConfigs —— 那时本步骤要改成直接取它
+            echo "::error::未找到未签名产物：$APK_OUT_RELEASE"
+            ls -la app/build/outputs/apk/release/ || true
+            exit 1
+          fi
+
+          mkdir -p dist
+          "$ZIPALIGN" -p 4 -f "$APK_OUT_RELEASE" "dist/${APKNAME}"
+          "$APKSIGNER" sign --ks "$SIGN_KS" --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:STORE_PASSWORD --key-pass env:KEY_PASSWORD \
+            --min-sdk-version 29 --v1-signing-enabled false \
+            --v2-signing-enabled true --v3-signing-enabled true "dist/${APKNAME}"
+
+          # 命名自检（拿实际文件名校验，不只信规则自洽）
+          RE='^[A-Za-z0-9._-]+_[0-9]{8}-[0-9]{4}_ci-release_[0-9a-f]{8}\.apk$'
+          printf '%s' "${APKNAME}" | grep -qE "$RE" \
+            || { echo "::error::产物名与规则不符（或含空格/括号等 URL 不友好字符）：${APKNAME}"; exit 1; }
+          echo "✅ 已签名并命名：dist/${APKNAME}"
+          ls -la dist
+
+      # 断言产物真的可用：三件套 / 作用域 / 入口类 / 身份 / 版本 / 变体 / ABI / 签名——全是
+      #   **静默失败模式**（包照样装、照样跑，只是模块不生效或版本不对），故做成门禁。
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS}"
+          APKSIGNER="$BT/apksigner"
+          AAPT2="$BT/aapt2"
+          APK="dist/${{ steps.target.outputs.apkname }}"
+          NAME="$(basename "$APK")"
+          echo "════ 校验 $NAME"
+
+          if [ "${MODULE_KIND:-xposed}" = "xposed" ]; then
+            # ① libxposed 三件套 —— 缺任何一个，LSPosed 都不会把 APK 认成模块
+            MISSING=""
+            for e in META-INF/xposed/java_init.list META-INF/xposed/module.prop META-INF/xposed/scope.list; do
+              unzip -l "$APK" | grep -q "$e" || MISSING="$MISSING $e"
+            done
+            [ -z "$MISSING" ] || { echo "::error::$NAME 缺 libxposed 三件套:$MISSING"; exit 1; }
+            echo "  ✅ META-INF/xposed 三件套齐全"
+
+            # ② 本项目是**动态作用域**：staticScope=false + scope.list 为空是正常形态（门禁方向与
+            #    母版相反 —— 母版断言 scope.list 非空，那在本仓库必红）
+            PROPS="$(unzip -p "$APK" META-INF/xposed/module.prop)"
+            printf '%s' "$PROPS" | grep -q "^targetApiVersion=${EXPECT_TARGET_API}$" \
+              || { echo "::error::$NAME 的 module.prop 缺 targetApiVersion=${EXPECT_TARGET_API}"; exit 1; }
+            printf '%s' "$PROPS" | grep -q "^staticScope=false$" \
+              || { echo "::error::$NAME 不是动态作用域（staticScope 非 false）—— scope.list 为空时模块会拿不到任何作用域"; exit 1; }
+            SCOPE="$(unzip -p "$APK" META-INF/xposed/scope.list | grep -vE '^[[:space:]]*#' | tr -d '[:space:]')"
+            [ -z "$SCOPE" ] || { echo "::error::$NAME 的 scope.list 非空（$SCOPE）—— 本项目走动态作用域，静态声明未启用却填了作用域"; exit 1; }
+            echo "  ✅ 动态作用域（staticScope=false、scope.list 为空）"
+
+            # ③ 入口类必须真在 dex 里，且与 java_init.list 写的名字一致。release 走 R8 ⇒ 这是唯一
+            #    能拦住「proguard-rules 漏 keep」的地方
+            ENTRY="$(unzip -p "$APK" META-INF/xposed/java_init.list | grep -vE '^[[:space:]]*#' | grep -vE '^[[:space:]]*$' | head -1 | tr -d '[:space:]')"
+            [ -n "$ENTRY" ] || { echo "::error::$NAME 的 java_init.list 里没有入口类"; exit 1; }
+            ENTRY_DESC="L$(printf '%s' "$ENTRY" | tr '.' '/');"
+            FOUND=0
+            for d in $(unzip -l "$APK" | awk '$4 ~ /^classes[0-9]*\.dex$/ {print $4}'); do
+              if unzip -p "$APK" "$d" | grep -qaF "$ENTRY_DESC"; then FOUND=1; break; fi
+            done
+            [ "$FOUND" -eq 1 ] || { echo "::error::$NAME 的入口类 $ENTRY（$ENTRY_DESC）不在任何 dex 里 —— 被裁剪或改名"; exit 1; }
+            echo "  ✅ 入口类在 dex 中：$ENTRY"
+          fi
+
+          BADGING="$("$AAPT2" dump badging "$APK" 2>/dev/null || true)"
+          # 每个 `VAR="$(... | grep ...)"` 都带 `|| true`：grep 无匹配返回 1，在 bash -e 下会让
+          #   赋值整体失败 ⇒ 脚本静默退出（日志只剩 exit code 1，看不出哪条断言挂了）
+          PKG_LINE="$(printf '%s' "$BADGING" | grep -m1 "^package:" || true)"
+          [ -n "$PKG_LINE" ] || { echo "::error::$NAME 读不到 badging 的 package 行"; exit 1; }
+
+          # ④ fork 身份：包名、显示名（ci-fork-identity.py 改写后应为 fork 值）
+          printf '%s' "$PKG_LINE" | grep -Fq "name='${EXPECT_PACKAGE}'" \
+            || { echo "::error::$NAME 包名不是 fork 身份（期望 ${EXPECT_PACKAGE}）：$PKG_LINE"; exit 1; }
+          LABEL_LINE="$(printf '%s' "$BADGING" | grep -m1 "^application-label:" || true)"
+          printf '%s' "$LABEL_LINE" | grep -Fq "'${EXPECT_LABEL}'" \
+            || { echo "::error::$NAME 显示名不是 ${EXPECT_LABEL}：${LABEL_LINE:-<空>}"; exit 1; }
+          echo "  ✅ fork 身份：${EXPECT_PACKAGE} / ${EXPECT_LABEL}"
+
+          # ⑤ 版本号必须与源码一致（code 是 CI 序列，versionName 多一节 vsemver 元数据）
+          printf '%s' "$PKG_LINE" | grep -q "versionCode='${CODE}'" \
+            || { echo "::error::$NAME 的 versionCode 与预期不符（期望 ${CODE}）：$PKG_LINE"; exit 1; }
+          printf '%s' "$PKG_LINE" | grep -Fq "versionName='${EXPECT_VN}'" \
+            || { echo "::error::$NAME 的 versionName 与预期不符（期望 ${EXPECT_VN}）：$PKG_LINE"; exit 1; }
+          echo "  ✅ 版本号：${EXPECT_VN}(${CODE})"
+
+          # ⑥ 变体：release 不许带 application-debuggable（带了 = 日志没裁，不是最终形态）
+          DBG="$(printf '%s' "$BADGING" | grep -c "^application-debuggable$" || true)"
+          [ "$DBG" -eq 0 ] || { echo "::error::$NAME 含 application-debuggable —— 确认构建的是 assembleRelease"; exit 1; }
+          echo "  ✅ release 变体（非 debuggable）"
+
+          # ⑦ ABI：MMKV 2 只有 64 位原生库，工程 abiFilters 只要 arm64-v8a
+          printf '%s' "$BADGING" | grep -q "^native-code: '${EXPECT_ABI}'$" \
+            || { echo "::error::$NAME 的原生库不是单 ${EXPECT_ABI}"; printf '%s\n' "$BADGING" | grep "^native-code" || true; exit 1; }
+          echo "  ✅ 单 ABI：${EXPECT_ABI}"
+
+          # ⑧ 签名有效 + 指纹等于固定密钥
+          OUT="$("$APKSIGNER" verify --print-certs "$APK" 2>&1 || true)"
+          if printf '%s' "$OUT" | grep -qi 'DOES NOT VERIFY\|Missing.*signature\|no signature'; then
+            echo "::error::$NAME 未通过签名校验 —— 拒绝发布"
+            printf '%s\n' "$OUT"
+            exit 1
+          fi
+          DIGEST="$(printf '%s' "$OUT" | sed -nE 's/^.*certificate SHA-256 digest: ([0-9a-fA-F]+).*$/\1/p' | head -1)"
+          [ -n "$DIGEST" ] || { echo "::error::$NAME 读不到签名证书指纹"; printf '%s\n' "$OUT"; exit 1; }
+          ACTUAL="$(printf '%s' "$DIGEST" | tr -d ':' | tr 'a-f' 'A-F')"
+          if [ "$ACTUAL" != "$EXPECTED_CERT_SHA256" ]; then
+            echo "::error::$NAME 签名指纹与固定密钥不符 —— 拒绝发布（多半是 secrets 没配好）"
+            echo "  期望: $EXPECTED_CERT_SHA256"
+            echo "  实际: $ACTUAL"
+            exit 1
+          fi
+          echo "  ✅ 签名有效，指纹与固定密钥一致"
+
+          # ⑨ 签名方案 v2+v3 都必须在。⚠️ 必须带 --min-sdk-version 24：verify 默认按 manifest 的
+          #    minSdk 判定，minSdk ≥ 28 时 apksig 视 v2 为冗余、**跳过其验证与上报** ⇒ 报的是上报
+          #    语义而非块缺失。不断言 v1：它只服务 Android ≤6.0，本步骤签名时已显式关闭。
+          VERBOSE="$("$APKSIGNER" verify --verbose --min-sdk-version 24 "$APK" 2>&1 || true)"
+          for scheme in v2 v3; do
+            printf '%s' "$VERBOSE" | grep -qE "Verified using ${scheme} scheme.*: true" \
+              || { echo "::error::$NAME 未启用 ${scheme} 签名方案 —— 拒绝发布"; printf '%s\n' "$VERBOSE"; exit 1; }
+          done
+          echo "  ✅ 签名方案含 v2+v3"
+
+      # artifact 名必须带 run_number：upload-artifact 拒绝同名（不是覆盖），而「同一 commit、同一
+      #   分钟内重复触发」会让 ts 与短号都相同。
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.PREFIX }}-release-${{ steps.info.outputs.ts }}-${{ steps.info.outputs.short }}-${{ github.run_number }}
+          path: dist/*.apk
+          if-no-files-found: error
+
+      # 发布：**每次构建发一个独立 Release**（tag 与产物名同源）。同一 tag 只会出现在重跑时 ⇒
+      #   走 edit 覆盖；prerelease 且 latest=false：CI 包不抢「最新」。
+      # ⚠️ **不要给 asset 写 label**：GitHub 用 label 顶替文件名显示，打了 label 的包整行变成
+      #   label，看着就像产物名被改坏。
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_TAG: ${{ steps.target.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          SHORT="${GITHUB_SHA:0:8}"
+          NOTES="**Commit** [\`${SHORT}\`](https://github.com/${REPO}/commit/${GITHUB_SHA})"
+          NOTES="$NOTES · **Branch** \`${GITHUB_REF_NAME}\` · **Version** ${VER} (versionCode ${CODE})"
+          NOTES="$NOTES · **Variants** release"
+
+          if gh release view "$TARGET_TAG" >/dev/null 2>&1; then
+            echo "tag $TARGET_TAG 已存在 —— 按重跑处理"
+            gh release edit "$TARGET_TAG" --notes "$NOTES" --prerelease --latest=false
+          else
+            jq -n --arg t "$TARGET_TAG" --arg b "$NOTES" --arg c "$GITHUB_SHA" \
+              '{tag_name:$t, name:$t, target_commitish:$c, body:$b, prerelease:true}' \
+            | gh api -X POST "/repos/${REPO}/releases" --input -
+          fi
+
+          gh release upload "$TARGET_TAG" dist/*.apk --clobber >/dev/null
+          echo "已发布：https://github.com/${REPO}/releases/tag/${TARGET_TAG}"
+          echo "资产：$(ls dist/*.apk | tr '\n' ' ')"

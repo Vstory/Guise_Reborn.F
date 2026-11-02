@@ -4,20 +4,8 @@
   "prerelease": true,
   "title": "Guise 2.1.2",
   "notes": "增强定位伪装效果，优化机型与版本伪装兼容性。",
-  "releaseUrl": "https://github.com/daxiaamu/Guise_Reborn/releases/tag/v2.1.2",
-  "apkUrls": [
-    "https://gh-proxy.com/https://github.com/daxiaamu/Guise_Reborn/releases/download/v2.1.2/Guise-2.1.2.apk",
-    "https://ghfast.top/https://github.com/daxiaamu/Guise_Reborn/releases/download/v2.1.2/Guise-2.1.2.apk",
-    "https://ghproxy.net/https://github.com/daxiaamu/Guise_Reborn/releases/download/v2.1.2/Guise-2.1.2.apk",
-    "https://ghproxy.vip/https://github.com/daxiaamu/Guise_Reborn/releases/download/v2.1.2/Guise-2.1.2.apk?sha=43ab8d518af6ab49fe1bf562e635c0dfef89eb046cde137855198d1216a45418",
-    "https://gh.jasonzeng.dev/https://github.com/daxiaamu/Guise_Reborn/releases/download/v2.1.2/Guise-2.1.2.apk",
-    "https://gh.3w.pm/https://github.com/daxiaamu/Guise_Reborn/releases/download/v2.1.2/Guise-2.1.2.apk",
-    "https://v6.gh-proxy.com/https://github.com/daxiaamu/Guise_Reborn/releases/download/v2.1.2/Guise-2.1.2.apk",
-    "https://v6.gh-proxy.org/https://github.com/daxiaamu/Guise_Reborn/releases/download/v2.1.2/Guise-2.1.2.apk",
-    "https://gh-proxy.org/https://github.com/daxiaamu/Guise_Reborn/releases/download/v2.1.2/Guise-2.1.2.apk",
-    "https://xget.xi-xu.me/gh/daxiaamu/Guise_Reborn/releases/download/v2.1.2/Guise-2.1.2.apk",
-    "https://github.com/daxiaamu/Guise_Reborn/releases/download/v2.1.2/Guise-2.1.2.apk"
-  ],
-  "apkUrl": "https://github.com/daxiaamu/Guise_Reborn/releases/download/v2.1.2/Guise-2.1.2.apk",
-  "apkSha256": "43ab8d518af6ab49fe1bf562e635c0dfef89eb046cde137855198d1216a45418"
+  "releaseUrl": "https://github.com/Vstory/Guise_Reborn.F/releases",
+  "apkUrls": [],
+  "apkUrl": "",
+  "apkSha256": ""
 }
