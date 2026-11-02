@@ -224,15 +224,6 @@ jobs:
           echo "产物名=${NAME}"
           echo "包内版本=${VN}(${CODE})"
 
-      # 单测刻意排在包构建之前：早失败省下 R8 流水线；RandomsTest 等纯 JVM 用例在没有设备的
-      #   环境里唯一能跑的地方就是这里。用 testReleaseUnitTest 而不是 testDebug：本工程只出
-      #   release 包，跑 debug 单测等于白白多编译一整个 debug 变体。
-      - name: Unit tests (release)
-        run: |
-          set -euo pipefail
-          chmod +x gradlew
-          ./gradlew --no-daemon :app:testReleaseUnitTest :ktx-xposed:testReleaseUnitTest
-
       # 签名：固定密钥从 secrets 解码（各项目共用一把，见 tokens/Signing/）。
       #   ⚠️ 4 个 secret 名是配套的一组，改名要同改：本处与 tokens/Signing/README.md。
       #   ⚠️ 缺 secret 时**直接失败**：不回退 debug 签名 ——「构建成功、签名不对」要等覆盖安装

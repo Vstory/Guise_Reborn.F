@@ -1,0 +1,158 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# 单测门禁（与出包链路解耦）：与 build-ci-release.yml 并行跑，失败自动开 issue。
+#
+# 为什么单独一份、而不是塞进出包 workflow：
+#   · 出包链路（R8 + 签名 + 发布页）与「逻辑对不对」互不阻塞 —— 测试挂了不该拖住拿包；
+#   · 跑一份测试要单独编译一遍被测变体，塞进出包等于把它串在关键路径上。
+# 为什么不用 matrix：`:app` 依赖 `:ktx-xposed`，app 那个 job 无论怎么拆都要编译两个模块，
+#   拆成多 job 只是把同一份编译重复 N 次（runner 时间翻倍、缓存分裂），墙钟不变。
+#
+# 被测变体固定 debug：AGP 9 默认只为「被测试的 buildType」（debug）创建单测任务，
+#   `:app:testReleaseUnitTest` 根本不存在（AGP 9 的 onlyEnableUnitTestForTheTestedBuildType
+#   默认 true）。这与「发布物只出 release」不冲突 —— 这里只编译被测 classes，不产出、不发布任何包。
+# ══════════════════════════════════════════════════════════════════════════════
+name: Checks · Unit tests
+
+run-name: "Checks · Unit tests · ${{ github.ref_name }}"
+
+on:
+  push:
+    branches: ['**']
+    # paths 白名单：只有会改变编译结果/测试行为的改动才跑，纯文档、纯资源、manifest 数据不动代码
+    paths:
+      - 'app/src/**'
+      - 'ktx-xposed/src/**'
+      - '**/*.gradle.kts'
+      - 'gradle/**'
+      - 'gradle.properties'
+      - 'app/version.properties'
+      - '.github/workflows/check.yml'
+  workflow_dispatch:
+
+# 同分支只留最新一次：测试结果对旧提交没有意义，新提交进来就取消还在跑的
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write   # 失败时自动开 issue / 恢复时关闭
+
+env:
+  JAVA_VERSION: '21'
+  ANDROID_PLATFORM: android-37.0
+  BUILD_TOOLS: 37.0.0
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-26.04
+    env:
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: init.defaultBranch
+      GIT_CONFIG_VALUE_0: main
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up JDK
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # 单测要 AGP 编译被测 classes，仍需要 platform 与 build-tools（compileSdk 37 不在镜像里）
+      - name: Set up Android SDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKM="$(command -v sdkmanager || echo "$SDK/cmdline-tools/latest/bin/sdkmanager")"
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          for pkg in "platforms;${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}"; do
+            "$SDKM" "$pkg" >/dev/null 2>&1 || sudo "$SDKM" "$pkg" >/dev/null 2>&1 \
+              || echo "::warning::$pkg 安装返回非零"
+          done
+          test -f "$SDK/platforms/${ANDROID_PLATFORM}/android.jar" \
+            || { echo "::error::platforms/${ANDROID_PLATFORM} 未就位"; exit 1; }
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+      # key 与 build-ci-release.yml 同源 ⇒ 两边共用同一份缓存（谁先跑谁填充）
+      - name: Gradle cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', 'gradle/libs.versions.toml', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Unit tests
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:testDebugUnitTest :ktx-xposed:testDebugUnitTest
+
+      # 失败才动作：没有失败就没有 issue。标题固定含分支名 ⇒ 去重键稳定，同一分支连挂
+      #   只会在同一条 issue 上追加，不会每推一次长出一条。
+      - name: Report failure to issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          TITLE="CI: unit tests failing on ${GITHUB_REF_NAME}"
+
+          # 失败用例从 JUnit XML 取（Gradle 控制台只打一行 FAILED，拿不到归类）
+          SUMMARY="$(python3 - <<'PY'
+          import glob, xml.etree.ElementTree as ET
+          rows = []
+          for f in glob.glob('**/build/test-results/**/*.xml', recursive=True):
+              try:
+                  root = ET.parse(f).getroot()
+              except Exception:
+                  continue
+              for case in root.iter('testcase'):
+                  if case.find('failure') is not None or case.find('error') is not None:
+                      rows.append(f"- `{case.get('classname')}.{case.get('name')}`")
+          print("\n".join(rows[:30]) if rows else "- 测试报告未生成（编译或配置期失败），见 run 日志")
+          PY
+          )"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          BODY="**Branch** \`${GITHUB_REF_NAME}\` · **Commit** \`${GITHUB_SHA:0:8}\` · **Run**: ${RUN_URL}
+
+          ${SUMMARY}"
+
+          NUM="$(gh issue list --repo "$REPO" --state open --limit 200 --json number,title \
+                   --jq ".[] | select(.title == \"${TITLE}\") | .number" | head -1)"
+          if [ -n "${NUM:-}" ]; then
+            echo "已存在 open issue #${NUM} —— 追加评论"
+            gh issue comment "$NUM" --repo "$REPO" --body "$BODY"
+          else
+            echo "新建 issue"
+            gh issue create --repo "$REPO" --title "$TITLE" --body "$BODY"
+          fi
+          # 同时在 run 摘要里留一份，省得去 issue 里翻
+          {
+            echo "### 单测失败"
+            echo
+            echo "$BODY"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 恢复即关闭：issue 只在「当前仍然失败」时为 open，不代表历史
+      - name: Close stale issue on success
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          TITLE="CI: unit tests failing on ${GITHUB_REF_NAME}"
+          NUM="$(gh issue list --repo "$REPO" --state open --limit 200 --json number,title \
+                   --jq ".[] | select(.title == \"${TITLE}\") | .number" | head -1)"
+          if [ -z "${NUM:-}" ]; then
+            echo "没有对应的 open issue，什么都不做"
+            exit 0
+          fi
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh issue comment "$NUM" --repo "$REPO" \
+            --body "已在 \`${GITHUB_SHA:0:8}\` 通过 —— ${RUN_URL}"
+          gh issue close "$NUM" --repo "$REPO"
