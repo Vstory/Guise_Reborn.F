@@ -1,0 +1,181 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# 手动出一条 :guise-test 检测包（Guise 测试）。上游从不发布它的安装包、其 android.yml 也只
+#   assembleDebug 不上传 —— 想装到手机上只能自己编。本工作流只产 artifact，不建 Release 页、
+#   不动 latest-*.json，与 build-ci-release.yml 完全隔离。
+#
+# 环境（runner / JDK / SDK / action pin / 缓存 key）逐项对齐 build-ci-release.yml，
+#   唯一区别：签名用固定密钥而不是 debug key —— CI 上 ~/.android/debug.keystore 每次重建，
+#   用 debug 签名出的包换个 run 就覆盖安装失败。
+# ══════════════════════════════════════════════════════════════════════════════
+name: Build · Test APK
+
+run-name: "Build · Test APK · ${{ github.ref_name }}"
+
+on:
+  # workflow_dispatch 只认默认分支上注册过的 workflow，所以 feature 分支上要靠 push 触发才跑得起来
+  push:
+    branches: ['**']
+    paths:
+      - 'guise-test/**'
+      - 'gradle/**'
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+      - '.github/workflows/build-test-apk.yml'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '要构建的提交/tag（留空则构建当前触发 ref）'
+        type: string
+        required: false
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: '21'
+  ANDROID_PLATFORM: android-37.0
+  BUILD_TOOLS: 37.0.0
+  # guise-test 没有 signingConfigs ⇒ assembleRelease 出未签名包，签名在后面手工做
+  APK_UNSIGNED: guise-test/build/outputs/apk/release/guise-test-release-unsigned.apk
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    env:
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: init.defaultBranch
+      GIT_CONFIG_VALUE_0: main
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Set up JDK
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # 自 API 37 起平台包名带 minor：装出来的目录是 platforms/android-37.0，compileSdk 的
+      #   minorApiLevel=0 正是按这个名字找 —— 改成 android-37 反而找不到。
+      - name: Set up Android SDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKM="$(command -v sdkmanager || echo "$SDK/cmdline-tools/latest/bin/sdkmanager")"
+          echo "SDK=$SDK"
+
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          for pkg in "platforms;${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}"; do
+            "$SDKM" "$pkg" >/dev/null 2>&1 || sudo "$SDKM" "$pkg" >/dev/null 2>&1 \
+              || echo "::warning::$pkg 安装返回非零"
+          done
+
+          test -f "$SDK/platforms/${ANDROID_PLATFORM}/android.jar" \
+            || { echo "::error::platforms/${ANDROID_PLATFORM} 未就位"; exit 1; }
+          test -x "$SDK/build-tools/${BUILD_TOOLS}/aapt2" \
+            || { echo "::error::build-tools ${BUILD_TOOLS} 就位失败"; exit 1; }
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+      - name: Gradle cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', 'gradle/libs.versions.toml', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Prepare signing (fixed key from secrets)
+        env:
+          KEY_BASE64: ${{ secrets.KEY_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for v in KEY_BASE64 STORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::缺少签名 secret:$missing"
+            exit 1
+          fi
+
+          KS="$GITHUB_WORKSPACE/ci-signing.jks"
+          printf '%s' "$KEY_BASE64" | base64 -d > "$KS"
+          keytool -list -keystore "$KS" -storepass:env STORE_PASSWORD -alias "$KEY_ALIAS" >/dev/null 2>&1 \
+            || { echo "::error::密钥库打不开或别名不存在"; exit 1; }
+          echo "SIGN_KS=$KS" >> "$GITHUB_ENV"
+
+      - name: Gradle build
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon :guise-test:assembleRelease
+          ls -la guise-test/build/outputs/apk/release/ || true
+
+      - name: Sign APK
+        env:
+          STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS}"
+          VER="$(sed -n 's/^ *versionName = "\(.*\)"$/\1/p' guise-test/build.gradle.kts | head -1)"
+          [ -n "$VER" ] || { echo "::error::读不到 guise-test 的 versionName"; exit 1; }
+          NAME="Guise.Test_${VER}_$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)_${GITHUB_SHA:0:8}.apk"
+
+          [ -f "$APK_UNSIGNED" ] || {
+            echo "::error::未找到未签名产物：$APK_UNSIGNED"
+            ls -la guise-test/build/outputs/apk/release/ || true
+            exit 1
+          }
+
+          mkdir -p dist
+          # zipalign 必须在 apksigner 之前；v1 关闭（minSdk 29 下无作用）
+          "$BT/zipalign" -p 4 -f "$APK_UNSIGNED" "dist/${NAME}"
+          "$BT/apksigner" sign --ks "$SIGN_KS" --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:STORE_PASSWORD --key-pass env:KEY_PASSWORD \
+            --min-sdk-version 29 --v1-signing-enabled false \
+            --v2-signing-enabled true --v3-signing-enabled true "dist/${NAME}"
+
+          "$BT/apksigner" verify --print-certs "dist/${NAME}" | grep -i 'certificate SHA-256 digest' || true
+          echo "APK_NAME=${NAME}" >> "$GITHUB_ENV"
+          echo "✅ dist/${NAME}"
+          ls -la dist
+
+      # 只拦「装不上」这一类静默问题：包名/显示名/变体/方案。检测项本身对不对由手机上看。
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS}"
+          APK="dist/${APK_NAME}"
+          BADGING="$("$BT/aapt2" dump badging "$APK" 2>/dev/null || true)"
+          PKG_LINE="$(printf '%s' "$BADGING" | grep -m1 "^package:" || true)"
+          [ -n "$PKG_LINE" ] || { echo "::error::读不到 package 行"; exit 1; }
+          printf '%s' "$PKG_LINE" | grep -Fq "name='com.daxiaamu.guise.test'" \
+            || { echo "::error::包名不对：$PKG_LINE"; exit 1; }
+          LABEL="$(printf '%s' "$BADGING" | grep -m1 "^application-label:" || true)"
+          printf '%s' "$LABEL" | grep -Fq "'Guise Test'" \
+            || { echo "::error::显示名不对：${LABEL:-<空>}"; exit 1; }
+          printf '%s' "$BADGING" | grep -q "^launchable-activity:" \
+            || { echo "::error::没有可启动 Activity"; exit 1; }
+          "$BT/apksigner" verify "$APK" >/dev/null 2>&1 \
+            || { echo "::error::签名校验未通过"; exit 1; }
+          echo "✅ ${APK_NAME}：com.daxiaamu.guise.test / Guise Test / 已签名"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          # artifact 名必须带 run_number：upload-artifact 拒绝同名，同 commit 同分钟重跑会撞
+          name: Guise-Test-${{ github.sha }}-${{ github.run_number }}
+          path: dist/*.apk
+          if-no-files-found: error
