@@ -1,0 +1,284 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# 出 :guise-test 检测包（Guise Test / Guise 测试）并发布到**固定一个** Release 页。
+#   上游从不发布它的安装包、其 android.yml 也只 assembleDebug 不上传 —— 想装到手机上只能自己编。
+#
+# 与 build-ci-release.yml（正式包）的隔离点：
+#   ① tag 固定 `guise-test`，不用 ci- 前缀 ⇒ 那个工作流的 Sweep（只匹配 ^ci-…）不会误删这一页；
+#      也不以 v 开头 ⇒ 不触发上游 publish-release-manifest.yml。
+#   ② 产物名用测试 App 的名称（Guise.Test_<版本>_<versionCode>.apk），不带 fork 前缀 Guise.F ——
+#      一眼分得清正式包与测试包，也能看出手机里装的是哪一次构建。
+#   ③ guise-test 的 versionCode/versionName 是硬编码，不改的话手机上的包分不出新旧、也覆盖不了
+#      升级。版本号按本项目既有做法只在 runner 工作区改写（同 ci-fork-identity.py），源码不动。
+#
+# 环境（runner / JDK / SDK / action pin / 缓存 key / 固定签名密钥）逐项对齐 build-ci-release.yml。
+# ══════════════════════════════════════════════════════════════════════════════
+name: Build · Test APK
+
+run-name: "Build · Test APK · ${{ github.ref_name }}"
+
+on:
+  # workflow_dispatch 只认默认分支上注册过的 workflow，所以 feature 分支上要靠 push 触发才跑得起来
+  push:
+    branches: ['**']
+    paths:
+      - 'guise-test/**'
+      - 'gradle/**'
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+      - '.github/workflows/build-test-apk.yml'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '要构建的提交/tag（留空则构建当前触发 ref）'
+        type: string
+        required: false
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # 发布 Release 需要写权限
+
+env:
+  JAVA_VERSION: '21'
+  ANDROID_PLATFORM: android-37.0
+  BUILD_TOOLS: 37.0.0
+  # 一版一页（同正式包模型）：tag 放 test- 前缀，标题写测试 App 的名称 + 版本，
+  #   与正式包的 ci- 页在列表里一眼分得开，也互不干扰两边的 Sweep
+  TAG_PREFIX: test-
+  TAG_PATTERN: '^test-[0-9]{8}-[0-9]{4}-[0-9a-f]{8}-r[0-9]+$'
+  TITLE_BASE: 'Guise Test'
+  # guise-test 没有 signingConfigs ⇒ assembleRelease 出未签名包，签名在后面手工做
+  APK_UNSIGNED: guise-test/build/outputs/apk/release/guise-test-release-unsigned.apk
+  # 测试包自己的版本序列，与正式包的 5000+ 分开（包名不同，互不影响）
+  TEST_VERSION_CODE_BASE: '1000'
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    env:
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: init.defaultBranch
+      GIT_CONFIG_VALUE_0: main
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.sha }}
+
+      # 被 concurrency 取消的 run 跳过后续所有 step ⇒ 停在「页已建、包没传完」时自己收不了尾，
+      #   只能由下一个 run 在开头顺手清。判据同正式包；TAG_PATTERN 这道筛子不能省 —— 正式包页
+      #   （ci- 前缀）和图床页同样是 prerelease，只按 prerelease 筛会把它们一起删掉。
+      - name: Sweep release pages of cancelled runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          WF=$(basename "${GITHUB_WORKFLOW_REF%%@*}")
+          rows=$(gh run list --workflow "$WF" --limit 100 \
+                   --json headSha,conclusion \
+                   --jq '.[] | "\(.headSha) \(.conclusion)"' || true)
+          dead=$(printf '%s\n' "$rows" | awk '
+                   $2 == "success"   { ok[$1] = 1 }
+                   $2 == "cancelled" { seen[$1] = 1 }
+                   END { for (s in seen) if (!(s in ok)) print s }')
+          if [ -z "${dead//[[:space:]]/}" ]; then
+            echo "没有「只被取消过」的提交，跳过"
+            exit 0
+          fi
+          gh api "repos/${REPO}/releases?per_page=100" \
+            --jq '.[] | select(.prerelease) | "\(.target_commitish)\t\(.tag_name)\t\(.assets|length)"' \
+          | while IFS=$'\t' read -r sha tag assets; do
+              grep -qxF "$sha" <<<"$dead" || continue
+              grep -qE "$TAG_PATTERN" <<<"$tag" || continue
+              echo "::notice::清理被取消运行的测试包页 ${tag}（资产 ${assets} 个）"
+              gh api -X DELETE "repos/${REPO}/releases/tags/${tag}" || true
+              gh api -X DELETE "repos/${REPO}/git/refs/tags/${tag}" || true
+            done
+
+      - name: Set up JDK
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # 自 API 37 起平台包名带 minor：装出来的目录是 platforms/android-37.0，compileSdk 的
+      #   minorApiLevel=0 正是按这个名字找 —— 改成 android-37 反而找不到。
+      - name: Set up Android SDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKM="$(command -v sdkmanager || echo "$SDK/cmdline-tools/latest/bin/sdkmanager")"
+          echo "SDK=$SDK"
+
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          for pkg in "platforms;${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}"; do
+            "$SDKM" "$pkg" >/dev/null 2>&1 || sudo "$SDKM" "$pkg" >/dev/null 2>&1 \
+              || echo "::warning::$pkg 安装返回非零"
+          done
+
+          test -f "$SDK/platforms/${ANDROID_PLATFORM}/android.jar" \
+            || { echo "::error::platforms/${ANDROID_PLATFORM} 未就位"; exit 1; }
+          test -x "$SDK/build-tools/${BUILD_TOOLS}/aapt2" \
+            || { echo "::error::build-tools ${BUILD_TOOLS} 就位失败"; exit 1; }
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+      - name: Gradle cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', 'gradle/libs.versions.toml', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Prepare signing (fixed key from secrets)
+        env:
+          KEY_BASE64: ${{ secrets.KEY_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for v in KEY_BASE64 STORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::缺少签名 secret:$missing"
+            exit 1
+          fi
+
+          KS="$GITHUB_WORKSPACE/ci-signing.jks"
+          printf '%s' "$KEY_BASE64" | base64 -d > "$KS"
+          keytool -list -keystore "$KS" -storepass:env STORE_PASSWORD -alias "$KEY_ALIAS" >/dev/null 2>&1 \
+            || { echo "::error::密钥库打不开或别名不存在"; exit 1; }
+          echo "SIGN_KS=$KS" >> "$GITHUB_ENV"
+
+      # 只在 runner 工作区改 guise-test 的版本号（源码与上游保持一致）。每条替换前都断言命中 1 次，
+      #   上游改了写法就整体失败，不会静默出一版版本号不变的包 —— 那种包在手机上看着像没更新。
+      - name: Override test app version
+        run: |
+          set -euo pipefail
+          F=guise-test/build.gradle.kts
+          CODE=$(( TEST_VERSION_CODE_BASE + GITHUB_RUN_NUMBER ))
+          VN="1.2.1+test.${GITHUB_SHA:0:8}"
+
+          for pat in '^ *versionCode = [0-9]+$' '^ *versionName = "[^"]*"$'; do
+            n=$(grep -cE "$pat" "$F" || true)
+            [ "$n" -eq 1 ] || { echo "::error::$F 里 /$pat/ 命中 $n 次（期望 1）"; exit 1; }
+          done
+
+          sed -i -E "s/^ *versionCode = [0-9]+$/    versionCode = ${CODE}/" "$F"
+          sed -i -E "s/^ *versionName = \"[^\"]*\"$/    versionName = \"${VN}\"/" "$F"
+          grep -nE 'version(Code|Name)' "$F"
+
+          # 产物名用测试 App 的名称 + 版本，不带 fork 前缀：一眼能区分正式包（Guise.F_…）与
+          #   测试包，也能看出手机里装的是哪一次构建（每次 versionCode 递增）
+          BASE_VER="$(sed -nE 's/^ *versionName = "([^"+]*).*/\1/p' "$F" | head -1)"
+          ASSET="Guise.Test_${BASE_VER}_${CODE}.apk"
+          echo "产物名=${ASSET}"
+
+          {
+            echo "CODE=${CODE}"
+            echo "VN=${VN}"
+            echo "ASSET=${ASSET}"
+          } >> "$GITHUB_ENV"
+
+      - name: Gradle build
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon :guise-test:assembleRelease
+          ls -la guise-test/build/outputs/apk/release/ || true
+
+      - name: Sign APK
+        env:
+          STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS}"
+          [ -f "$APK_UNSIGNED" ] || {
+            echo "::error::未找到未签名产物：$APK_UNSIGNED"
+            ls -la guise-test/build/outputs/apk/release/ || true
+            exit 1
+          }
+
+          mkdir -p dist
+          # zipalign 必须在 apksigner 之前；v1 关闭（minSdk 29 下无作用）
+          "$BT/zipalign" -p 4 -f "$APK_UNSIGNED" "dist/${ASSET}"
+          "$BT/apksigner" sign --ks "$SIGN_KS" --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:STORE_PASSWORD --key-pass env:KEY_PASSWORD \
+            --min-sdk-version 29 --v1-signing-enabled false \
+            --v2-signing-enabled true --v3-signing-enabled true "dist/${ASSET}"
+          echo "✅ dist/${ASSET}"
+          ls -la dist
+
+      # 只拦「装不上 / 装上去看不出是哪一版」这一类静默问题：包名、显示名、入口、
+      #   注入后的版本号、签名。检测项本身对不对只能在手机上看。
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS}"
+          APK="dist/${ASSET}"
+          BADGING="$("$BT/aapt2" dump badging "$APK" 2>/dev/null || true)"
+          PKG_LINE="$(printf '%s' "$BADGING" | grep -m1 "^package:" || true)"
+          [ -n "$PKG_LINE" ] || { echo "::error::读不到 package 行"; exit 1; }
+          printf '%s' "$PKG_LINE" | grep -Fq "name='com.daxiaamu.guise.test'" \
+            || { echo "::error::包名不对：$PKG_LINE"; exit 1; }
+          LABEL="$(printf '%s' "$BADGING" | grep -m1 "^application-label:" || true)"
+          printf '%s' "$LABEL" | grep -Fq "'Guise Test'" \
+            || { echo "::error::显示名不对：${LABEL:-<空>}"; exit 1; }
+          printf '%s' "$BADGING" | grep -q "^launchable-activity:" \
+            || { echo "::error::没有可启动 Activity"; exit 1; }
+          printf '%s' "$PKG_LINE" | grep -q "versionCode='${CODE}'" \
+            || { echo "::error::versionCode 未注入（期望 ${CODE}）：$PKG_LINE"; exit 1; }
+          printf '%s' "$PKG_LINE" | grep -Fq "versionName='${VN}'" \
+            || { echo "::error::versionName 未注入（期望 ${VN}）：$PKG_LINE"; exit 1; }
+          "$BT/apksigner" verify "$APK" >/dev/null 2>&1 \
+            || { echo "::error::签名校验未通过"; exit 1; }
+          echo "✅ ${ASSET}：com.daxiaamu.guise.test / Guise Test / ${VN}(${CODE})"
+
+      # 一版一页：每次构建发一个独立页，标题 = 测试 App 名称 + 版本，与正式包（ci- 前缀、
+      #   Guise.F 标题）在 Release 列表里一眼分得开。同一 tag 只会出现在重跑时 ⇒ 走 edit 覆盖。
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TS="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)"
+          TAG="${TAG_PREFIX}${TS}-${GITHUB_SHA:0:8}-r${GITHUB_RUN_NUMBER}"
+          TITLE="${TITLE_BASE} ${VN}"
+
+          NOTES="**Guise 测试 / Guise Test** — 用于验证 Guise 模块的 hook 在目标 App 里是否生效的检测 App。"
+          NOTES="$NOTES"$'\n\n'
+          NOTES="$NOTES- 版本：${VN}（versionCode ${CODE}）"$'\n'
+          NOTES="$NOTES- 构建：${TS:0:8} ${TS:9:2}:${TS:11:2} (Asia/Shanghai)"$'\n'
+          NOTES="$NOTES- 分支：\`${GITHUB_REF_NAME}\` · [\`${GITHUB_SHA:0:8}\`](https://github.com/${REPO}/commit/${GITHUB_SHA})"$'\n'
+          NOTES="$NOTES- 用法：装好后到 Guise 里给「Guise 测试」勾上作用域，再启动本 App 查看各项数值"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "tag ${TAG} 已存在 —— 按重跑处理"
+            gh release edit "$TAG" --title "$TITLE" --notes "$NOTES" --prerelease --latest=false
+          else
+            jq -n --arg t "$TAG" --arg n "$TITLE" --arg b "$NOTES" --arg c "$GITHUB_SHA" \
+              '{tag_name:$t, name:$n, target_commitish:$c, body:$b, prerelease:true}' \
+            | gh api -X POST "/repos/${REPO}/releases" --input -
+          fi
+
+          gh release upload "$TAG" "dist/${ASSET}" --clobber >/dev/null
+          echo "已发布：https://github.com/${REPO}/releases/tag/${TAG}"
+          echo "资产：${ASSET}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          # artifact 名必须带 run_number：upload-artifact 拒绝同名，同 commit 同分钟重跑会撞
+          name: Guise.Test-${{ github.sha }}-${{ github.run_number }}
+          path: dist/*.apk
+          if-no-files-found: error
