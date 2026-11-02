@@ -220,7 +220,10 @@ private fun ConfigEditorItems(state: ModuleConfigState, launch: () -> Unit) {
     }
 
 
-    Title(text = stringResource(R.string.title_sim))
+    Title(
+        text = stringResource(R.string.title_sim),
+        supportingText = stringResource(R.string.net_sim_random_summary),
+    )
     PresetInputBox(
         state.simOperator,
         stringResource(R.string.net_sim_code),
@@ -233,12 +236,9 @@ private fun ConfigEditorItems(state: ModuleConfigState, launch: () -> Unit) {
             state.simCountry.value = carrier.countryCode.lowercase()
         }
     }
-    RandomInputBox(state.simOperatorName, stringResource(R.string.net_sim_name)) {
-        state.applyRandomCarrier(carrierPresets).name
-    }
-    RandomInputBox(state.simCountry, stringResource(R.string.net_sim_iso)) {
-        state.applyRandomCarrier(carrierPresets).countryCode.lowercase()
-    }
+    // 名称与国家码不再单独给随机按钮：三者必须同源，多一个入口就多一条「只随机其中一项」的路
+    InputBox(state.simOperatorName, stringResource(R.string.net_sim_name))
+    InputBox(state.simCountry, stringResource(R.string.net_sim_iso))
 
 
     Title(text = stringResource(R.string.title_unique_id))
