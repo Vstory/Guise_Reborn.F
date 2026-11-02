@@ -275,6 +275,16 @@ jobs:
           echo "已发布：https://github.com/${REPO}/releases/tag/${TAG}"
           echo "资产：${ASSET}"
 
+          # 测试包只留最新一页：旧页连 tag 一起删（只删 release 会留下孤儿 tag）。
+          #   created_at 是 ISO 串，直接 sort -r 即时间降序；head -1 那页就是刚发的。
+          gh api "repos/${REPO}/releases?per_page=100" \
+            --jq ".[] | select(.tag_name | startswith(\"${TAG_PREFIX}\")) | \"\(.created_at)\t\(.tag_name)\"" \
+          | sort -r | tail -n +2 | while IFS=$'\t' read -r _ old; do
+              gh api -X DELETE "repos/${REPO}/releases/tags/${old}" >/dev/null 2>&1 || true
+              gh api -X DELETE "repos/${REPO}/git/refs/tags/${old}" >/dev/null 2>&1 || true
+              echo "::notice::清理旧测试包页 ${old}"
+            done
+
       - name: Upload artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
