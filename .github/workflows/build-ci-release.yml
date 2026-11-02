@@ -328,13 +328,16 @@ jobs:
               || { echo "::error::$NAME 的 module.prop 缺 targetApiVersion=${EXPECT_TARGET_API}"; exit 1; }
             printf '%s' "$PROPS" | grep -q "^staticScope=false$" \
               || { echo "::error::$NAME 不是动态作用域（staticScope 非 false）—— scope.list 为空时模块会拿不到任何作用域"; exit 1; }
-            SCOPE="$(unzip -p "$APK" META-INF/xposed/scope.list | grep -vE '^[[:space:]]*#' | tr -d '[:space:]')"
+            # ⚠️ `|| true` 不是保险而是必需：scope.list 是空文件时 `grep -v` 一条都没匹配到、退出码
+            #   为 1，pipefail 下整条赋值语句失败 ⇒ 脚本在 `set -e` 里静默退出（日志只剩
+            #   "Process completed with exit code 1."，看不出是哪条断言挂了）
+            SCOPE="$(unzip -p "$APK" META-INF/xposed/scope.list | grep -vE '^[[:space:]]*#' | tr -d '[:space:]' || true)"
             [ -z "$SCOPE" ] || { echo "::error::$NAME 的 scope.list 非空（$SCOPE）—— 本项目走动态作用域，静态声明未启用却填了作用域"; exit 1; }
             echo "  ✅ 动态作用域（staticScope=false、scope.list 为空）"
 
             # ③ 入口类必须真在 dex 里，且与 java_init.list 写的名字一致。release 走 R8 ⇒ 这是唯一
             #    能拦住「proguard-rules 漏 keep」的地方
-            ENTRY="$(unzip -p "$APK" META-INF/xposed/java_init.list | grep -vE '^[[:space:]]*#' | grep -vE '^[[:space:]]*$' | head -1 | tr -d '[:space:]')"
+            ENTRY="$(unzip -p "$APK" META-INF/xposed/java_init.list | grep -vE '^[[:space:]]*#' | grep -vE '^[[:space:]]*$' | head -1 | tr -d '[:space:]' || true)"
             [ -n "$ENTRY" ] || { echo "::error::$NAME 的 java_init.list 里没有入口类"; exit 1; }
             ENTRY_DESC="L$(printf '%s' "$ENTRY" | tr '.' '/');"
             FOUND=0
