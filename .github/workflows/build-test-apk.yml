@@ -45,9 +45,11 @@ env:
   JAVA_VERSION: '21'
   ANDROID_PLATFORM: android-37.0
   BUILD_TOOLS: 37.0.0
-  # 固定页：标题就是测试 App 的名称；资产名每次带版本走（见 Override 步骤），页面只留最新一份
-  TAG: guise-test
-  TITLE: 'Guise Test'
+  # 一版一页（同正式包模型）：tag 放 test- 前缀，标题写测试 App 的名称 + 版本，
+  #   与正式包的 ci- 页在列表里一眼分得开，也互不干扰两边的 Sweep
+  TAG_PREFIX: test-
+  TAG_PATTERN: '^test-[0-9]{8}-[0-9]{4}-[0-9a-f]{8}-r[0-9]+$'
+  TITLE_BASE: 'Guise Test'
   # guise-test 没有 signingConfigs ⇒ assembleRelease 出未签名包，签名在后面手工做
   APK_UNSIGNED: guise-test/build/outputs/apk/release/guise-test-release-unsigned.apk
   # 测试包自己的版本序列，与正式包的 5000+ 分开（包名不同，互不影响）
@@ -65,6 +67,37 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ inputs.ref || github.sha }}
+
+      # 被 concurrency 取消的 run 跳过后续所有 step ⇒ 停在「页已建、包没传完」时自己收不了尾，
+      #   只能由下一个 run 在开头顺手清。判据同正式包；TAG_PATTERN 这道筛子不能省 —— 正式包页
+      #   （ci- 前缀）和图床页同样是 prerelease，只按 prerelease 筛会把它们一起删掉。
+      - name: Sweep release pages of cancelled runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          WF=$(basename "${GITHUB_WORKFLOW_REF%%@*}")
+          rows=$(gh run list --workflow "$WF" --limit 100 \
+                   --json headSha,conclusion \
+                   --jq '.[] | "\(.headSha) \(.conclusion)"' || true)
+          dead=$(printf '%s\n' "$rows" | awk '
+                   $2 == "success"   { ok[$1] = 1 }
+                   $2 == "cancelled" { seen[$1] = 1 }
+                   END { for (s in seen) if (!(s in ok)) print s }')
+          if [ -z "${dead//[[:space:]]/}" ]; then
+            echo "没有「只被取消过」的提交，跳过"
+            exit 0
+          fi
+          gh api "repos/${REPO}/releases?per_page=100" \
+            --jq '.[] | select(.prerelease) | "\(.target_commitish)\t\(.tag_name)\t\(.assets|length)"' \
+          | while IFS=$'\t' read -r sha tag assets; do
+              grep -qxF "$sha" <<<"$dead" || continue
+              grep -qE "$TAG_PATTERN" <<<"$tag" || continue
+              echo "::notice::清理被取消运行的测试包页 ${tag}（资产 ${assets} 个）"
+              gh api -X DELETE "repos/${REPO}/releases/tags/${tag}" || true
+              gh api -X DELETE "repos/${REPO}/git/refs/tags/${tag}" || true
+            done
 
       - name: Set up JDK
         uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
@@ -210,23 +243,27 @@ jobs:
             || { echo "::error::签名校验未通过"; exit 1; }
           echo "✅ ${ASSET}：com.daxiaamu.guise.test / Guise Test / ${VN}(${CODE})"
 
-      # 固定页 + 固定资产名：页面标题就是测试 App 的名称，下载链接永远不变。
-      #   每次构建覆盖 assets（先删旧 apk 资产，避免历史残留堆成一列）。
+      # 一版一页：每次构建发一个独立页，标题 = 测试 App 名称 + 版本，与正式包（ci- 前缀、
+      #   Guise.F 标题）在 Release 列表里一眼分得开。同一 tag 只会出现在重跑时 ⇒ 走 edit 覆盖。
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          TS="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)"
+          TAG="${TAG_PREFIX}${TS}-${GITHUB_SHA:0:8}-r${GITHUB_RUN_NUMBER}"
+          TITLE="${TITLE_BASE} ${VN}"
+
           NOTES="**Guise 测试 / Guise Test** — 用于验证 Guise 模块的 hook 在目标 App 里是否生效的检测 App。"
           NOTES="$NOTES"$'\n\n'
           NOTES="$NOTES- 版本：${VN}（versionCode ${CODE}）"$'\n'
-          NOTES="$NOTES- 构建：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M') (Asia/Shanghai)"$'\n'
+          NOTES="$NOTES- 构建：${TS:0:8} ${TS:9:2}:${TS:11:2} (Asia/Shanghai)"$'\n'
           NOTES="$NOTES- 分支：\`${GITHUB_REF_NAME}\` · [\`${GITHUB_SHA:0:8}\`](https://github.com/${REPO}/commit/${GITHUB_SHA})"$'\n'
           NOTES="$NOTES- 用法：装好后到 Guise 里给「Guise 测试」勾上作用域，再启动本 App 查看各项数值"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "固定页已存在，覆盖更新"
+            echo "tag ${TAG} 已存在 —— 按重跑处理"
             gh release edit "$TAG" --title "$TITLE" --notes "$NOTES" --prerelease --latest=false
           else
             jq -n --arg t "$TAG" --arg n "$TITLE" --arg b "$NOTES" --arg c "$GITHUB_SHA" \
@@ -234,16 +271,9 @@ jobs:
             | gh api -X POST "/repos/${REPO}/releases" --input -
           fi
 
-          # 清掉旧 apk 资产（改名或历史上传残留），再传固定名
-          gh api "repos/${REPO}/releases/tags/${TAG}" \
-            --jq '.assets[] | select(.name | endswith(".apk")) | .id' 2>/dev/null \
-          | while read -r id; do
-              [ -n "$id" ] && gh api -X DELETE "repos/${REPO}/releases/assets/${id}" >/dev/null || true
-            done
-
-          gh release upload "$TAG" "dist/${ASSET}" --clobber
+          gh release upload "$TAG" "dist/${ASSET}" --clobber >/dev/null
           echo "已发布：https://github.com/${REPO}/releases/tag/${TAG}"
-          echo "下载：https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
+          echo "资产：${ASSET}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
