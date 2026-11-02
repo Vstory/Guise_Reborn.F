@@ -1,6 +1,7 @@
 package com.houvven.guise.util.android
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -77,8 +78,13 @@ class RandomsTest {
     fun wifiNameKeepsRouterStylePrefixAndNoQuotes() {
         repeat(200) {
             val ssid = Randoms.randomWifiSsid()
-            assertTrue("$ssid 没有命中任何真实热点前缀", Randoms.SSID_PREFIXES.any(ssid::startsWith))
-            assertTrue("$ssid 长度不对", ssid.length in 9..20)
+            val prefix = Randoms.SSID_PREFIXES.firstOrNull(ssid::startsWith)
+            assertNotNull("$ssid 没有命中任何真实热点前缀", prefix)
+            // 前缀之后必须是 4 位大写十六进制（少数带 _5G），而不是随机长度的字符
+            assertTrue(
+                "$ssid 的后缀形态不对",
+                Regex("[0-9A-F]{4}(_5G)?").matches(ssid.removePrefix(prefix!!)),
+            )
             assertTrue("$ssid 带了引号，WifiHook 会再包一层", '"' !in ssid)
         }
     }
