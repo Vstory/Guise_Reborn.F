@@ -1,5 +1,6 @@
 package com.houvven.guise.util.android
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -43,6 +44,43 @@ class RandomsTest {
         assertTrue(Randoms.randomBuildId("15").startsWith("AP3A."))
         assertTrue(Randoms.randomBuildId("16").startsWith("BP2A."))
         assertTrue(Randoms.randomBuildId("17").startsWith("CP1A."))
+    }
+
+    @Test
+    fun wifiAddressesLookLikeRealHardware() {
+        val localNibbles = setOf('2', '6', 'a', 'e')
+        repeat(500) {
+            listOf(Randoms.randomMacAddress(), Randoms.randomBssid()).forEach { address ->
+                assertTrue(address.matches(Regex("[0-9a-f]{2}(:[0-9a-f]{2}){5}")))
+                assertTrue(
+                    "$address 的首字节第二低位是本地管理位（真实网卡不会是这个形态）",
+                    address[1] !in localNibbles,
+                )
+            }
+        }
+    }
+
+    @Test
+    fun addressPoolsAreGloballyAdministeredAndDisjoint() {
+        val localNibbles = setOf('2', '6', 'a', 'e')
+        val pool = Randoms.NIC_OUIS + Randoms.ROUTER_OUIS
+        assertEquals(pool.size, pool.distinct().size)
+        pool.forEach { oui ->
+            assertTrue("$oui 不是 6 位小写十六进制", oui.matches(Regex("[0-9a-f]{6}")))
+            assertTrue("$oui 的 U/L 位是 1", oui[1] !in localNibbles)
+        }
+        // 网卡池与路由器池不能相交，否则 MAC 与 BSSID 可能撞成同一个地址
+        assertTrue(Randoms.NIC_OUIS.intersect(Randoms.ROUTER_OUIS.toSet()).isEmpty())
+    }
+
+    @Test
+    fun wifiNameKeepsRouterStylePrefixAndNoQuotes() {
+        repeat(200) {
+            val ssid = Randoms.randomWifiSsid()
+            assertTrue("$ssid 没有命中任何真实热点前缀", Randoms.SSID_PREFIXES.any(ssid::startsWith))
+            assertTrue("$ssid 长度不对", ssid.length in 9..20)
+            assertTrue("$ssid 带了引号，WifiHook 会再包一层", '"' !in ssid)
+        }
     }
 
     private fun isValidImei(value: String): Boolean {

@@ -48,6 +48,7 @@ import com.houvven.guise.module.preset.CarrierPresetRepository
 import com.houvven.guise.module.preset.PresetRepository
 import com.houvven.guise.module.preset.TimeZonePresetRepository
 import com.houvven.guise.ui.components.SearchBox
+import com.houvven.guise.ui.utils.applyRandomCarrier
 import com.houvven.guise.util.android.Randoms
 import com.houvven.guise.xposed.config.ModuleConfigState
 import kotlin.math.roundToInt
@@ -208,9 +209,15 @@ private fun ConfigEditorItems(state: ModuleConfigState, launch: () -> Unit) {
         label = stringResource(R.string.net_type),
         preset = presetCatalog.networks,
     )
-    InputBox(state.wifiSSID, stringResource(R.string.net_wifi_ssid))
-    InputBox(state.wifiBSSID, stringResource(R.string.net_wifi_bssid))
-    InputBox(state.wifiMacAddress, stringResource(R.string.net_wifi_mac))
+    RandomInputBox(state.wifiSSID, stringResource(R.string.net_wifi_ssid)) {
+        Randoms.randomWifiSsid()
+    }
+    RandomInputBox(state.wifiBSSID, stringResource(R.string.net_wifi_bssid)) {
+        Randoms.randomBssid()
+    }
+    RandomInputBox(state.wifiMacAddress, stringResource(R.string.net_wifi_mac)) {
+        Randoms.randomMacAddress()
+    }
 
 
     Title(text = stringResource(R.string.title_sim))
@@ -218,15 +225,20 @@ private fun ConfigEditorItems(state: ModuleConfigState, launch: () -> Unit) {
         state.simOperator,
         stringResource(R.string.net_sim_code),
         carrierPresets,
+        randomGenerator = { state.applyRandomCarrier(carrierPresets).plmn },
     ) { plmn ->
         carrierPresets.firstOrNull { it.plmn == plmn }?.let { carrier ->
             state.simOperatorName.value = carrier.name
             state.simOperator.value = carrier.plmn
-            state.simCountry.value = carrier.countryCode
+            state.simCountry.value = carrier.countryCode.lowercase()
         }
     }
-    InputBox(state.simOperatorName, stringResource(R.string.net_sim_name))
-    InputBox(state.simCountry, stringResource(R.string.net_sim_iso))
+    RandomInputBox(state.simOperatorName, stringResource(R.string.net_sim_name)) {
+        state.applyRandomCarrier(carrierPresets).name
+    }
+    RandomInputBox(state.simCountry, stringResource(R.string.net_sim_iso)) {
+        state.applyRandomCarrier(carrierPresets).countryCode.lowercase()
+    }
 
 
     Title(text = stringResource(R.string.title_unique_id))
