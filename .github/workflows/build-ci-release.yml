@@ -132,8 +132,8 @@ jobs:
         run: |
           set -euo pipefail
           git fetch -q origin main
-          mkdir -p scripts
-          git show origin/main:scripts/ci-fork-identity.py > scripts/ci-fork-identity.py
+          # 取 main 上最新的编排器与全部改写脚本（一改动一脚本），覆盖 checkout 出来的旧版
+          git archive origin/main scripts/ci-fork-identity.py scripts/fork_edits | tar -x -C .
 
       # 包名 / 显示名 / 更新源只在 runner 工作区改写：仓库里留着 fork 值会让上游一改这些行就冲突。
       #   逐条按「期望原文出现次数必须为 1」校验，上游改写法时整体失败，不静默漏改。
