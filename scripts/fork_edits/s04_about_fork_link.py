@@ -24,7 +24,7 @@ UPSTREAM_LINK_BLOCK = """        LinkSettingItem(
 """
 
 FORK_LINK_BLOCK = f"""        LinkSettingItem(
-            icon = Icons.Default.AccountTree,
+            icon = Icons.Default.ForkRight,
             title = stringResource(R.string.settings_fork_source_code),
             summary = stringResource(R.string.settings_fork_source_code_summary),
             url = "https://github.com/{FORK_REPOSITORY}",
@@ -34,12 +34,13 @@ FORK_LINK_BLOCK = f"""        LinkSettingItem(
 
 def build_edits() -> list[tuple[str, str, str, int]]:
     return [
-        # 图标 import 必须一起加，否则 AccountTree 解析不到 —— 编译器不会替我们补。
+        # 图标 import 必须一起加，否则 ForkRight 解析不到 —— 编译器不会替我们补。
+        #   用 ForkRight（同 Kelivo.F 关于页的 Lucide.GitFork 语义），material-icons-extended 里有。
         (
             SETTING_SCREEN,
             "import androidx.compose.material.icons.filled.Code\n",
-            "import androidx.compose.material.icons.filled.AccountTree\n"
-            "import androidx.compose.material.icons.filled.Code\n",
+            "import androidx.compose.material.icons.filled.Code\n"
+            "import androidx.compose.material.icons.filled.ForkRight\n",
             1,
         ),
         (SETTING_SCREEN, UPSTREAM_LINK_BLOCK, UPSTREAM_LINK_BLOCK + FORK_LINK_BLOCK, 1),
@@ -47,15 +48,15 @@ def build_edits() -> list[tuple[str, str, str, int]]:
             STRINGS,
             '    <string name="settings_view_source_code_summary">View source code on GitHub and submit issues</string>\n',
             '    <string name="settings_view_source_code_summary">View source code on GitHub and submit issues</string>\n'
-            '    <string name="settings_fork_source_code">Fork repository</string>\n'
-            '    <string name="settings_fork_source_code_summary">Source code and builds of this fork (Guise.F)</string>\n',
+            '    <string name="settings_fork_source_code">Guise.F</string>\n'
+            '    <string name="settings_fork_source_code_summary">Source code and builds of this fork</string>\n',
             1,
         ),
         (
             STRINGS_ZH,
             '    <string name="settings_view_source_code_summary">在Github查看源代码，提交issues</string>\n',
             '    <string name="settings_view_source_code_summary">在Github查看源代码，提交issues</string>\n'
-            '    <string name="settings_fork_source_code">Fork 项目地址</string>\n'
+            '    <string name="settings_fork_source_code">Guise.F</string>\n'
             '    <string name="settings_fork_source_code_summary">本 fork 的源码与构建产物</string>\n',
             1,
         ),
