@@ -253,6 +253,7 @@ private constructor(
         passVideo = state.passVideo.value
         passAudio = state.passAudio.value
         passApplications = state.passApplications.value
+        customProperties = state.customProperties.value
     }
 
     companion object {

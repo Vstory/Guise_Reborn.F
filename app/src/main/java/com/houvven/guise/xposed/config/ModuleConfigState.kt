@@ -55,9 +55,12 @@ class ModuleConfigState private constructor(moduleConfig: ModuleConfig) {
     val passAudio = mutableStateOf(moduleConfig.passAudio)
     val passApplications = mutableStateOf(moduleConfig.passApplications)
 
+    val customProperties = mutableStateOf(moduleConfig.customProperties)
+
     internal fun clear() {
         stringStates.forEach { it.value = "" }
         booleanStates.forEach { it.value = false }
+        customProperties.value = emptyList()
     }
 
     private val stringStates: List<MutableState<String>>
