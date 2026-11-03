@@ -2,6 +2,7 @@ package com.houvven.guise.xposed.hook
 
 import android.os.Build
 import com.houvven.guise.xposed.LoadPackageHandler
+import com.houvven.guise.xposed.config.sanitizeCustomProperties
 import com.houvven.ktx_xposed.hook.beforeHookAllMethods
 import com.houvven.ktx_xposed.hook.findClass
 import com.houvven.ktx_xposed.hook.setStaticField
@@ -51,6 +52,13 @@ class OsBuildHook : LoadPackageHandler {
             }
         }
 
+        // 自定义键值对：与内置字段同源的键一律丢弃（上面那轮已负责），避免 Build.XXX 与 getprop 自相矛盾
+        sanitizeCustomProperties(config.customProperties).forEach { (key, value) ->
+            if (key !in fakedProps) {
+                fakedProps[key] = value
+            }
+        }
+
         hookSystemProperties(fakedProps)
     }
 
@@ -71,11 +79,22 @@ class OsBuildHook : LoadPackageHandler {
                 fakedProps[key]?.let { param.result = it }
             }
 
-            fakedProps["ro.build.version.sdk"]?.toIntOrNull()?.let { sdk ->
-                systemProperties.beforeHookAllMethods("getInt") { param ->
-                    if (param.args.firstOrNull() == "ro.build.version.sdk") {
-                        param.result = sdk
-                    }
+            // 数值 / 布尔型属性走 getInt / getLong / getBoolean，只拦 get 会让它们读到真值
+            systemProperties.beforeHookAllMethods("getInt") { param ->
+                val key = param.args.firstOrNull() as? String ?: return@beforeHookAllMethods
+                fakedProps[key]?.toIntOrNull()?.let { param.result = it }
+            }
+
+            systemProperties.beforeHookAllMethods("getLong") { param ->
+                val key = param.args.firstOrNull() as? String ?: return@beforeHookAllMethods
+                fakedProps[key]?.toLongOrNull()?.let { param.result = it }
+            }
+
+            systemProperties.beforeHookAllMethods("getBoolean") { param ->
+                val key = param.args.firstOrNull() as? String ?: return@beforeHookAllMethods
+                when (fakedProps[key]?.lowercase()) {
+                    "true" -> param.result = true
+                    "false" -> param.result = false
                 }
             }
         }

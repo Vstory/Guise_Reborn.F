@@ -209,6 +209,8 @@ private fun ConfigEditorItems(state: ModuleConfigState, launch: () -> Unit) {
     }
 
 
+    CustomPropertiesEditor(state)
+
     Title(text = stringResource(R.string.title_net_info))
     PresetInputBox(
         state = state.networkType,

@@ -38,6 +38,14 @@
     <string name="device_display_density_summary">数值越大，界面元素越大</string>
     <string name="device_display_density_summary_with_dp">数值越大，界面元素越大；约等于开发者选项“最小宽度”%1$d dp</string>
     <string name="device_cpu">CPU代号</string>
+    <string name="title_custom_properties">自定义属性</string>
+    <string name="custom_property_summary">该应用可读取的额外系统属性，仅 Java 层生效；上方设备字段已覆盖的键不接受重复设置。</string>
+    <string name="custom_property_key">键名</string>
+    <string name="custom_property_value">值</string>
+    <string name="custom_property_key_conflict">已由上方设备字段设置</string>
+    <string name="custom_property_key_invalid">只能使用字母、数字、点和下划线</string>
+    <string name="custom_property_add">添加属性</string>
+    <string name="custom_property_remove">删除</string>
     <string name="net_type">网络类型</string>
     <string name="net_wifi_ssid">WiFi名称</string>
     <string name="net_sim_code">SIM运营商代码</string>

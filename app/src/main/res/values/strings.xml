@@ -55,6 +55,14 @@
     <string name="device_system_finger_print" translatable="false">FingerPrint</string>
     <string name="device_cpu">CPU Code</string>
     <string name="device_build_id" translatable="false">Build ID</string>
+    <string name="title_custom_properties">Custom Properties</string>
+    <string name="custom_property_summary">Extra system properties this app reads as if they were real. Applies to the Java layer only; keys already covered by the fields above are rejected.</string>
+    <string name="custom_property_key">Key</string>
+    <string name="custom_property_value">Value</string>
+    <string name="custom_property_key_conflict">Already set by a device field above</string>
+    <string name="custom_property_key_invalid">Letters, digits, dots and underscores only</string>
+    <string name="custom_property_add">Add property</string>
+    <string name="custom_property_remove">Remove</string>
     <string name="net_type">Internet Type</string>
     <string name="net_wifi_ssid">WiFi-SSID</string>
     <string name="net_wifi_bssid" translatable="false">WiFi-BSSID</string>
