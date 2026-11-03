@@ -50,6 +50,9 @@ data class ModuleConfig(
     var passVideo: Boolean = false,
     var passAudio: Boolean = false,
     var passApplications: Boolean = false,
+
+    /** 自定义系统属性；仅这些键的 SystemProperties.get* 返回伪造值。存 List 是为了容纳编辑中的空行。 */
+    var customProperties: List<CustomProperty> = emptyList(),
 ) {
     val isEnable: Boolean get() = enabled
 
