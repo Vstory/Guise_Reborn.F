@@ -48,7 +48,7 @@ def build_edits() -> list[tuple[str, str, str, int]]:
             STRINGS,
             '    <string name="settings_view_source_code_summary">View source code on GitHub and submit issues</string>\n',
             '    <string name="settings_view_source_code_summary">View source code on GitHub and submit issues</string>\n'
-            '    <string name="settings_fork_source_code">Guise.F</string>\n'
+            '    <string name="settings_fork_source_code">Guise_Reborn.F</string>\n'
             '    <string name="settings_fork_source_code_summary">Source code and builds of this fork</string>\n',
             1,
         ),
@@ -56,7 +56,7 @@ def build_edits() -> list[tuple[str, str, str, int]]:
             STRINGS_ZH,
             '    <string name="settings_view_source_code_summary">在Github查看源代码，提交issues</string>\n',
             '    <string name="settings_view_source_code_summary">在Github查看源代码，提交issues</string>\n'
-            '    <string name="settings_fork_source_code">Guise.F</string>\n'
+            '    <string name="settings_fork_source_code">Guise_Reborn.F</string>\n'
             '    <string name="settings_fork_source_code_summary">本 fork 的源码与构建产物</string>\n',
             1,
         ),
