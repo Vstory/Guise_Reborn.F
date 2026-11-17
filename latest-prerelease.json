@@ -1,9 +1,9 @@
 {
-  "versionCode": 31,
-  "versionName": "2.1.2",
+  "versionCode": 33,
+  "versionName": "2.1.4",
   "prerelease": true,
-  "title": "Guise 2.1.2",
-  "notes": "增强定位伪装效果，优化机型与版本伪装兼容性。",
+  "title": "Guise 2.1.4",
+  "notes": "增强定位伪装效果。",
   "releaseUrl": "https://github.com/Vstory/Guise_Reborn.F/releases",
   "apkUrls": [],
   "apkUrl": "",

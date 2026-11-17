@@ -6,6 +6,7 @@ import android.os.Bundle
 import androidx.core.content.edit
 import com.houvven.guise.ContextAmbient
 import com.houvven.guise.R
+import com.houvven.guise.module.apps.AppInfoProvider
 import com.houvven.guise.ui.GlobalSnackbarHost
 import com.houvven.guise.ui.routing.LauncherState
 import com.houvven.guise.xposed.PackageConfig
@@ -238,6 +239,9 @@ private constructor(
         longitude = state.longitude.value.toDoubleOrNull() ?: -1.0
         latitude = state.latitude.value.toDoubleOrNull() ?: -1.0
         randomOffset = state.randomOffset.value
+        randomOffsetMeters = state.randomOffsetMeters.value.toDoubleOrNull()
+            ?.takeIf { it.isFinite() && it in 0.0..ModuleConfig.MAX_RANDOM_OFFSET_METERS }
+            ?: ModuleConfig.DEFAULT_RANDOM_OFFSET_METERS
         makeWifiLocationFail = state.makeWifiLocationFail.value
         makeCellLocationFail = state.makeCellLocationFail.value
         versionCode = state.versionCode.value.toIntOrNull() ?: -1
@@ -271,19 +275,23 @@ private constructor(
         fun empty() = of(ModuleConfig())
 
         fun reconcileScope(service: XposedService) {
-            val desiredScope = ModuleConfig.getAllSaved()
-                .asSequence()
-                .filter { it.enabled }
-                .mapTo(mutableSetOf()) { it.packageName }
+            val installedPackages = runCatching {
+                AppInfoProvider.getInstalledPackageNames()
+            }.getOrNull() ?: return
             val currentScope = runCatching { service.getScope().toSet() }.getOrNull() ?: return
-            val removedPackages = currentScope - desiredScope
-            val addedPackages = desiredScope - currentScope
+            val changes = planScopeReconciliation(
+                savedConfigs = ModuleConfig.getAllSaved(),
+                installedPackages = installedPackages,
+                currentScope = currentScope,
+            )
+            val removedPackages = changes.removedPackages
+            val addedPackages = changes.addedPackages
             if (removedPackages.isNotEmpty()) {
-                runCatching { service.removeScope(removedPackages.toList()) }
+                runCatching { service.removeScope(removedPackages.sorted()) }
             }
             if (addedPackages.isNotEmpty()) {
                 service.requestScope(
-                    addedPackages.toList(),
+                    addedPackages.sorted(),
                     object : XposedService.OnScopeEventListener {
                         override fun onScopeRequestApproved(approved: List<String>) = Unit
                         override fun onScopeRequestFailed(message: String) = Unit
